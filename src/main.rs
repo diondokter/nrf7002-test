@@ -3,13 +3,18 @@
 #![feature(type_alias_impl_trait)]
 #![allow(unused_variables)]
 
-use core::{alloc::Layout, cell::RefCell, mem::MaybeUninit};
+use core::{
+    alloc::Layout,
+    cell::RefCell,
+    mem::{align_of, size_of, MaybeUninit},
+    ptr::NonNull, pin::pin,
+};
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_time::{Duration, Timer};
-use nrf_wifi::Platform;
+use nrf_wifi::OsalPlatform;
 use panic_probe as _;
 
 use crate::nrf_wifi::NrfWifi;
@@ -22,12 +27,14 @@ async fn main(spawner: Spawner) {
 }
 
 async fn run(_spawner: Spawner) -> ! {
-    disable_approtect();
-    let p = embassy_nrf::init(Default::default());
+    let mut config = embassy_nrf::config::Config::default();
+    config.debug = embassy_nrf::config::Debug::Allowed;
+    let p = embassy_nrf::init(config);
 
     defmt::println!("Started");
 
-    NrfWifi::new::<CurrentPlatform>();
+    let mut wifi = NrfWifi::new::<CurrentPlatform>();
+    pin!(wifi);
 
     let mut led = Output::new(p.P1_06, Level::Low, OutputDrive::Standard);
 
@@ -39,43 +46,12 @@ async fn run(_spawner: Spawner) -> ! {
     }
 }
 
-pub fn disable_approtect() {
-    let uicr: nrf5340_app_pac::UICR_S = unsafe { core::mem::transmute(()) };
-    let ctrlap: nrf5340_app_pac::CTRLAP_S = unsafe { core::mem::transmute(()) };
-    let nvmc: nrf5340_app_pac::NVMC_S = unsafe { core::mem::transmute(()) };
-
-    if !uicr.approtect.read().pall().is_unprotected() {
-        nvmc.config.write(|w| w.wen().wen());
-        while nvmc.ready.read().bits() == 0 {}
-        uicr.approtect.write(|w| w.pall().unprotected());
-        while nvmc.ready.read().bits() == 0 {}
-        nvmc.config.write(|w| w.wen().ren());
-    }
-
-    if !uicr.secureapprotect.read().pall().is_unprotected() {
-        nvmc.config.write(|w| w.wen().wen());
-        while nvmc.ready.read().bits() == 0 {}
-        uicr.secureapprotect.write(|w| w.pall().unprotected());
-        while nvmc.ready.read().bits() == 0 {}
-        nvmc.config.write(|w| w.wen().ren());
-    }
-
-    ctrlap
-        .approtect
-        .disable
-        .write(|w| unsafe { w.bits(0x50FA50FA) });
-    ctrlap
-        .secureapprotect
-        .disable
-        .write(|w| unsafe { w.bits(0x50FA50FA) });
-}
-
 struct CurrentPlatform;
 
 static HEAP: critical_section::Mutex<RefCell<linked_list_allocator::Heap>> =
     critical_section::Mutex::new(RefCell::new(linked_list_allocator::Heap::empty()));
 
-impl Platform for CurrentPlatform {
+impl OsalPlatform for CurrentPlatform {
     unsafe fn init() {
         static mut HEAP_BUFFER: [MaybeUninit<u8>; 1024] = [MaybeUninit::uninit(); 1024];
         critical_section::with(|cs| unsafe {
@@ -84,12 +60,22 @@ impl Platform for CurrentPlatform {
     }
 
     unsafe extern "C" fn mem_alloc(size: usize) -> *mut core::ffi::c_void {
-        critical_section::with(|cs| {
-            HEAP.borrow_ref_mut(cs)
-                .allocate_first_fit(Layout::from_size_align(size, 4).unwrap())
+        let alloc_size = size + size_of::<usize>();
+
+        // We allocate a usize extra that we prepend with the size of the allocation
+        let ptr = critical_section::with(|cs| {
+            HEAP.borrow_ref_mut(cs).allocate_first_fit(
+                Layout::from_size_align(alloc_size, align_of::<usize>()).unwrap(),
+            )
         })
         .unwrap()
-        .as_ptr() as _
+        .cast::<usize>();
+
+        unsafe {
+            ptr.as_ptr().write(size);
+        }
+
+        ptr.as_ptr().add(1).cast()
     }
 
     unsafe extern "C" fn mem_zalloc(size: usize) -> *mut core::ffi::c_void {
@@ -99,7 +85,17 @@ impl Platform for CurrentPlatform {
     }
 
     unsafe extern "C" fn mem_free(buf: *mut core::ffi::c_void) {
-        todo!()
+        // The size can be found just in front of what this pointer points to
+        let ptr = buf.cast::<usize>();
+
+        let alloc_size = unsafe { ptr.read() };
+
+        critical_section::with(|cs| {
+            HEAP.borrow_ref_mut(cs).deallocate(
+                NonNull::new(ptr.cast()).unwrap(),
+                Layout::from_size_align(alloc_size, align_of::<usize>()).unwrap(),
+            )
+        });
     }
 
     unsafe extern "C" fn mem_cpy(
@@ -223,21 +219,21 @@ impl Platform for CurrentPlatform {
 
     unsafe extern "C" fn log_dbg(
         fmt: *const core::ffi::c_char,
-        args: nrf700x_bindings::va_list,
+        args: nrf700x_sys::va_list,
     ) -> core::ffi::c_int {
         todo!()
     }
 
     unsafe extern "C" fn log_info(
         fmt: *const core::ffi::c_char,
-        args: nrf700x_bindings::va_list,
+        args: nrf700x_sys::va_list,
     ) -> core::ffi::c_int {
         todo!()
     }
 
     unsafe extern "C" fn log_err(
         fmt: *const core::ffi::c_char,
-        args: nrf700x_bindings::va_list,
+        args: nrf700x_sys::va_list,
     ) -> core::ffi::c_int {
         todo!()
     }
@@ -418,7 +414,7 @@ impl Platform for CurrentPlatform {
 
     unsafe extern "C" fn bus_pcie_dev_init(
         os_pcie_dev_ctx: *mut core::ffi::c_void,
-    ) -> nrf700x_bindings::wifi_nrf_status {
+    ) -> nrf700x_sys::wifi_nrf_status {
         todo!()
     }
 
@@ -432,7 +428,7 @@ impl Platform for CurrentPlatform {
         callback_fn: core::option::Option<
             unsafe extern "C" fn(callbk_data: *mut core::ffi::c_void) -> core::ffi::c_int,
         >,
-    ) -> nrf700x_bindings::wifi_nrf_status {
+    ) -> nrf700x_sys::wifi_nrf_status {
         todo!()
     }
 
@@ -444,7 +440,7 @@ impl Platform for CurrentPlatform {
         os_pcie_dev_ctx: *mut core::ffi::c_void,
         virt_addr: *mut core::ffi::c_void,
         size: usize,
-        dir: nrf700x_bindings::wifi_nrf_osal_dma_dir,
+        dir: nrf700x_sys::wifi_nrf_osal_dma_dir,
     ) -> *mut core::ffi::c_void {
         todo!()
     }
@@ -453,14 +449,14 @@ impl Platform for CurrentPlatform {
         os_pcie_dev_ctx: *mut core::ffi::c_void,
         dma_addr: *mut core::ffi::c_void,
         size: usize,
-        dir: nrf700x_bindings::wifi_nrf_osal_dma_dir,
+        dir: nrf700x_sys::wifi_nrf_osal_dma_dir,
     ) {
         todo!()
     }
 
     unsafe extern "C" fn bus_pcie_dev_host_map_get(
         os_pcie_dev_ctx: *mut core::ffi::c_void,
-        host_map: *mut nrf700x_bindings::wifi_nrf_osal_host_map,
+        host_map: *mut nrf700x_sys::wifi_nrf_osal_host_map,
     ) {
         todo!()
     }
@@ -486,7 +482,7 @@ impl Platform for CurrentPlatform {
 
     unsafe extern "C" fn bus_qspi_dev_init(
         os_qspi_dev_ctx: *mut core::ffi::c_void,
-    ) -> nrf700x_bindings::wifi_nrf_status {
+    ) -> nrf700x_sys::wifi_nrf_status {
         todo!()
     }
 
@@ -500,7 +496,7 @@ impl Platform for CurrentPlatform {
         callback_fn: core::option::Option<
             unsafe extern "C" fn(callbk_data: *mut core::ffi::c_void) -> core::ffi::c_int,
         >,
-    ) -> nrf700x_bindings::wifi_nrf_status {
+    ) -> nrf700x_sys::wifi_nrf_status {
         todo!()
     }
 
@@ -510,7 +506,7 @@ impl Platform for CurrentPlatform {
 
     unsafe extern "C" fn bus_qspi_dev_host_map_get(
         os_qspi_dev_ctx: *mut core::ffi::c_void,
-        host_map: *mut nrf700x_bindings::wifi_nrf_osal_host_map,
+        host_map: *mut nrf700x_sys::wifi_nrf_osal_host_map,
     ) {
         todo!()
     }

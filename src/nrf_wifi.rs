@@ -1,7 +1,8 @@
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use nrf700x_bindings::{
+use nrf700x_sys::{
     va_list, wifi_nrf_osal_dma_dir, wifi_nrf_osal_host_map, wifi_nrf_osal_ops, wifi_nrf_osal_priv,
     wifi_nrf_status,
 };
@@ -98,7 +99,7 @@ static mut OPS: wifi_nrf_osal_ops = wifi_nrf_osal_ops {
 };
 
 impl NrfWifi {
-    pub fn new<P: Platform>() -> Self {
+    pub fn new<P: OsalPlatform>() -> Self {
         if OPS_INITIALIZED
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -196,9 +197,15 @@ impl NrfWifi {
 
         unsafe { P::init() };
 
+        let osal = unsafe { nrf700x_sys::wifi_nrf_osal_init() };
+
         Self {
-            osal: unsafe { nrf700x_bindings::wifi_nrf_osal_init() },
+            osal,
         }
+    }
+
+    pub fn start_scan(self: Pin<&mut Self>) {
+        todo!()
     }
 }
 
@@ -207,7 +214,7 @@ impl NrfWifi {
 /// primitives where a one-to-one mapping is available. In case a mapping is not
 /// available an equivalent function will need to be implemented and that
 /// function will then need to be mapped to the corresponding Op.
-pub trait Platform {
+pub trait OsalPlatform {
     unsafe fn init();
 
     /// Allocate memory of @size bytes and return a pointer to the start
@@ -396,6 +403,6 @@ pub trait Platform {
 }
 
 #[no_mangle]
-extern "C" fn get_os_ops() -> *mut nrf700x_bindings::wifi_nrf_osal_ops {
+extern "C" fn get_os_ops() -> *mut nrf700x_sys::wifi_nrf_osal_ops {
     unsafe { &mut OPS as _ }
 }

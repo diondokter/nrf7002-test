@@ -678,12 +678,12 @@ dependencies = [
  "embassy-time",
  "linked_list_allocator",
  "nrf5340-app-pac",
- "nrf700x-bindings",
+ "nrf700x-sys",
  "panic-probe",
 ]
 
 [[package]]
-name = "nrf700x-bindings"
+name = "nrf700x-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen",
